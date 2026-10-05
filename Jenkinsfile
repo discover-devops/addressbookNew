@@ -1,103 +1,130 @@
 pipeline {
-    agent none
+
+    agent {
+        label 'AgentB'
+    }
+
+    environment {
+        DOCKER_IMAGE = 'discoverdevops/addressbook'
+        CONTAINER_NAME = 'addressbook'
+        HOST_PORT = '8080'
+        CONTAINER_PORT = '8080'
+    }
 
     stages {
 
-        stage('CI on AgentA') {
+        stage('Checkout') {
+            steps {
+                checkout scm
 
-            agent {
-                label 'AgentA'
+                sh '''
+                    echo "===== CHECKOUT ====="
+                    hostname
+                    git log -1 --oneline
+                '''
+            }
+        }
+
+        stage('Compile') {
+            steps {
+                sh '''
+                    echo "===== COMPILE ====="
+                    mvn -B clean compile
+                '''
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh '''
+                    echo "===== TEST ====="
+                    mvn -B test
+                '''
             }
 
-            stages {
-
-                stage('Checkout') {
-                    steps {
-                        checkout scm
-
-                        sh '''
-                            echo "===== CHECKOUT ====="
-                            hostname
-                            git log -1 --oneline
-                        '''
-                    }
-                }
-
-                stage('Compile') {
-                    steps {
-                        sh '''
-                            echo "===== COMPILE ====="
-                            mvn -B clean compile
-                        '''
-                    }
-                }
-
-                stage('Test') {
-                    steps {
-                        sh '''
-                            echo "===== TEST ====="
-                            mvn -B test
-                        '''
-                    }
-
-                    post {
-                        always {
-                            junit 'target/surefire-reports/*.xml'
-                        }
-                    }
-                }
-
-                stage('Package') {
-                    steps {
-                        sh '''
-                            echo "===== PACKAGE ====="
-                            mvn -B package -DskipTests
-                            ls -lh target/addressbook.war
-                        '''
-                    }
-                }
-
-                stage('Archive and Stash') {
-                    steps {
-
-                        archiveArtifacts(
-                            artifacts: 'target/addressbook.war',
-                            fingerprint: true
-                        )
-
-                        stash(
-                            name: 'war-file',
-                            includes: 'target/addressbook.war'
-                        )
-                    }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
                 }
             }
         }
 
-        stage('CD on AgentB') {
-
-            agent {
-                label 'AgentB'
+        stage('Package') {
+            steps {
+                sh '''
+                    echo "===== PACKAGE ====="
+                    mvn -B package -DskipTests
+                    ls -lh target/addressbook.war
+                '''
             }
+        }
 
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    echo "===== DOCKER BUILD ====="
+
+                    docker build \
+                      -t ${DOCKER_IMAGE}:${BUILD_NUMBER} \
+                      -t ${DOCKER_IMAGE}:latest \
+                      .
+                '''
+            }
+        }
+
+        stage('Docker Login and Push') {
             steps {
 
-                unstash 'war-file'
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
 
+                    sh '''
+                        echo "===== DOCKER LOGIN ====="
+
+                        echo "$DOCKER_PASSWORD" | docker login \
+                          -u "$DOCKER_USERNAME" \
+                          --password-stdin
+
+                        echo "===== DOCKER PUSH ====="
+
+                        docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
+                        docker push ${DOCKER_IMAGE}:latest
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Container') {
+            steps {
                 sh '''
-                    set -e
+                    echo "===== DEPLOY CONTAINER ====="
 
-                    echo "===== ARTIFACT ====="
-                    ls -lh target/addressbook.war
+                    docker rm -f ${CONTAINER_NAME} || true
 
-                    echo "===== DEPLOY ====="
+                    docker pull ${DOCKER_IMAGE}:${BUILD_NUMBER}
 
-                    rm -rf /opt/tomcat/webapps/addressbook
-                    rm -f /opt/tomcat/webapps/addressbook.war
+                    docker run -d \
+                      --name ${CONTAINER_NAME} \
+                      -p ${HOST_PORT}:${CONTAINER_PORT} \
+                      ${DOCKER_IMAGE}:${BUILD_NUMBER}
 
-                    cp target/addressbook.war \
-                       /opt/tomcat/webapps/addressbook.war
+                    echo "===== CONTAINER ====="
 
+                    docker ps
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
                     echo "===== VERIFY ====="
 
                     for i in $(seq 1 30); do
@@ -118,6 +145,7 @@ pipeline {
                     done
 
                     echo "DEPLOYMENT FAILED"
+                    docker logs ${CONTAINER_NAME} || true
                     exit 1
                 '''
             }
